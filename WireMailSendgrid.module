@@ -1,0 +1,481 @@
+<?php
+/**
+ * WireMailSendgrid - A SendGrid WireMail module 
+ * 
+ * @copyright Copyright (C) 2014 by Steve Beuret / SB3D
+ * @license http://www.gnu.org/licenses/gpl-2.0.txt GNU General Public License, version 2
+ * 
+ * For use with...
+ * ProcessWire 2.x 
+ * Copyright (C) 2014 by Ryan Cramer 
+ * Licensed under GNU/GPL v2, see LICENSE.TXT
+ * http://processwire.com
+ *
+ * Uses SendGrid's (http://sendgrid.com) PHP helper library V2.1.1.
+ * 
+ * It can send attachments, up to 7 MB per file. Attachments are not part of WireMailInterface.
+ * attachment('pathToFile');	
+ * 
+ * Status:
+ * 9/11/2014 Sends mail. Multiple recipients works. Attachments work. Not extensively tested.
+ * 9/19/2014 More fully developed configuration
+ * 
+ * 
+ * Quick Example:
+ * $mail = new WireMailSendgrid(); 
+ * $result = $mail->to('rocky@squirrel.com')->from('boris@pottsylvania.gov')->subject('WireMailSendgrid test message')->body('Raskolnikov!')->send();
+ * if (is_array($mail->error)){
+ *   echo implode('<br/>', $mail->error);
+ * }
+ * if(!empty($result)){
+ *   echo "Quantity sent: $result<br/>"
+ * }
+ * 
+ * 
+ * USAGE:
+ *
+ * $mail = new WireMail(); 
+ * 
+ * // chained method call usage
+ * $mail->to('user@domain.com')->from('you@company.com')->subject('Message Subject')->body('Message Body')->send();
+ *
+ * // separate method call usage
+ * $mail->to('user@domain.com'); // specify CSV string or array for multiple addresses
+ * $mail->from('you@company.com'); 
+ * $mail->subject('Message Subject'); 
+ * $mail->body('Message Body'); 
+ * $mail->send();
+ *
+ * // you can also set values without function calls:
+ * $mail->to = 'user@domain.com';
+ * $mail->from = 'you@company.com';
+ * ...and so on.
+ *
+ * // other methods or properties you might set (or get)
+ * $mail->bodyHTML('<html><body><h1>Message Body</h1></body></html>'); 
+ * $mail->header('X-Mailer', 'ProcessWire'); 
+ *
+ * // note that the send() function USUALLY returns the quantity of messages sent
+ * $numSent = $mail->send();
+ * 	
+ *
+ */
+
+class WireMailSendgrid extends WireMail implements Module, ConfigurableModule, WireMailInterface {
+
+
+	public static function getModuleInfo() {
+		return array(
+			'title'     => 'Wire Mail SendGrid',
+			'version'   => '0.0.1',
+			'summary'   => "extends WireMail, uses SendGrid's PHP library to interface to SendGrid mailing service",
+			'href'      => 'http://processwire.com/talk/topic/',
+			'author'    => 'SteveB',
+			'singular'  => false,
+			'autoload'  => false
+			);
+	}
+
+	const defaultSgPath = '/includes/sendgrid-php/';	//relative to site template dir
+	const defaultLogFileName = 'sendgrid-log';	//no extension
+
+	private	$sg = null; //our Sendgrid-php object
+	var $message = '';
+	var $error = '';
+		
+	/**
+	 * Mail properties
+	 *
+	 */
+	protected $mail = array(
+		'to' => array(), // to addresses - associative: both key and value are email (to prevent dups)
+		'toName' => array(), // to names - associative: indexed by 'to' email address, may be blank/null for any email 
+		'from' => '', 
+		'fromName' => '', 
+		'subject' => '', 
+		'body' => '',
+		'bodyHTML' => '',
+		'header' => array(),
+		'param' => array()
+	);
+	protected $email = null;
+	protected $sgPath = null;
+	protected $sgUser = null;
+	protected $sgPass = null;
+	protected $log = null; 
+	protected $logEnable = null;
+	protected $logFileName = null;
+
+    protected $data = array();	//used by the get/set functions
+
+	static public function getDefaultData() {
+		return array(
+		'defaultFrom' => 'processwire@' . wire('config')->httpHost,
+		'defaultFromName' => 'ProcessWire',
+		);
+	}
+    
+    
+	public function init() {	//https://processwire.com/talk/topic/7446-extending-module-problem-with-config/
+		//parent::init();
+	}	
+
+	public function __construct() {
+		global $config;
+		
+		foreach(self::getDefaultData() as $key => $value) {
+			$this->$key = $value;
+		}
+		$data = wire('modules')->getModuleConfigData($this); 
+		foreach($data as $k=>$v){
+			$this->set($k, $v);
+			$this->$k = $v;	//this is annoying but so is trying to use the result of $this->get() in ifs etc. "Fatal error: Can't use method return value in write context"
+			//if($this->log) $this->log->save('k='.$k.' v='.$v.' get='.$this->get($k).' '.__FUNCTION__.' @ '.__LINE__);	
+		}
+
+		if($this->logEnable && !empty($this->logFileName)) {
+			$this->log = new FileLog($config->paths->logs, $this->logFileName);	//$this->log->save('whatever message you want');
+		}
+
+		if(!empty($this->sgPath)){
+			//$this->log->save(__LINE__.' '.__FUNCTION__);
+			set_include_path(get_include_path() . PATH_SEPARATOR . $this->sgPath.'lib/' . PATH_SEPARATOR . $this->sgPath.'lib/SendGrid/');
+			require $config->paths->templates . $this->sgPath . 'vendor/autoload.php';
+			$options = array(
+			  'turn_off_ssl_verification' => true,
+			  'protocol' => 'https'
+			);
+			$this->sg = new SendGrid($this->sgUser, $this->sgPass, $options);
+			$this->mail['header']['X-Mailer'] = "ProcessWire/" . $this->className();
+			$this->email = new SendGrid\Email();
+			//$this->log->save('sgPath='.$this->sgPath.' '.__FUNCTION__.' @ '.__LINE__);
+		}
+		else{
+			if($this->log) $this->log->save('No sgPath in '.__FUNCTION__.' @ '.__LINE__);	
+			throw new WireException("Please set 'Path to SendGrid library' in module WireMailSendgrid."); 
+		}
+	}
+
+	
+
+	/**
+	 * Set the email to address
+	 *
+	 * Each added email addresses appends to any addresses already supplied, unless
+	 * you specify NULL as the email address, in which case it clears them all.
+	 *
+	 * @param string|array|null $email Specify any ONE of the following: 
+	 *	1. Single email address or "User Name <user@example.com>" string. 
+	 * 	2. CSV string of #1. 
+	 * 	3. Non-associative array of #1. 
+	 * 	4. Associative array of (email => name)
+	 *	5. NULL (default value, to clear out any previously set values)
+	 * @param string $name Optionally provide a FROM name, applicable
+	 *	only when specifying #1 (single email) for the first argument. 
+	 * @return this 
+	 * @throws WireException if any provided emails were invalid
+	 *
+	 */
+	public function to($email = null, $name = null) {
+
+		if(is_null($email)) { 
+			$this->email->setTos(array()); 	// clear existing values
+			return $this; 
+		}
+
+		$emails = is_array($email) ? $email : explode(',', $email); 
+
+		foreach($emails as $key => $value) {
+
+			$toName = '';
+			if(is_string($key)) {
+				// associative array
+				// email provided as $key, and $toName as value 
+				$toEmail = $key; 
+				$toName = $value; 
+
+			} else if(strpos($value, '<') !== false && strpos($value, '>') !== false) {
+				// toName supplied as: "User Name <user@example.com"
+				list($toEmail, $toName) = $this->extractEmailAndName($value); 
+
+			} else {
+				// just an email address, possibly with name as a function arg
+				$toEmail = $value; 
+			}
+
+			if(empty($toName)) $toName = $name; // use function arg if not overwritten
+			if($this->log) $this->log->save('toEmail='.$toEmail.' toName='.$toName.' '.__FUNCTION__.' @ '.__LINE__);	
+			$this->email->addTo($toEmail, $toName);	//$toName is optional, may be empty
+		}
+
+		return $this; 
+	}
+
+	/**
+	 * Set the 'to' name
+	 *
+	 * It is preferable to do this with the to() method, but this is provided to ensure that 
+	 * all properties can be set with direct access, i.e. $mailer->toName = 'User Name';
+	 *
+ 	 * This sets the 'to name' for whatever the last added 'to' email address was.
+	 *
+	 * @param string 
+	 * @return this 
+	 * @throws WireException if you attempt to set a toName before a to email. 
+	 *
+	 */
+	public function toName($name) {
+		$tos = $this->email->smtpapi->to;	//array
+		if(empty($tos)) throw new WireException("Please set a 'to' address before setting a name."); 
+		$last = array_pop($tos);
+		if($this->log) $this->log->save('last='.$last.' name='.$name.' '.__FUNCTION__.' @ '.__LINE__);	
+		$this->to($last, $name);	
+		return $this;
+	}
+
+	/**
+	 * Set the email from address
+	 *
+	 * @param string Must be a single email address or "User Name <user@example.com>" string.
+	 * @param string|null An optional FROM name (same as setting/calling fromName)
+	 * @return this 
+	 * @throws WireException if provided email was invalid
+	 *
+	 */
+	public function from($email, $name = null) {
+		if(is_null($name)) list($email, $name) = $this->extractEmailAndName($email); 
+		list($fromEmail, $fromName) = $this->extractEmailAndName($email); 
+		$this->email->setFrom($fromEmail);
+		if(!empty($fromName))$this->email->setFromName($fromName);
+		return $this; 
+	}
+
+	/**
+	 * Set the 'from' name
+	 *
+	 * It is preferable to do this with the from() method, but this is provided to ensure that 
+	 * all properties can be set with direct access, i.e. $mailer->fromName = 'User Name';
+	 *
+	 * @param string 
+	 * @return this 
+	 *
+	 * SendGrid error for omitting from address is (oddly) "Missing destination email"
+	 */
+	public function fromName($name) {
+		$fromName = $this->sanitizeHeader($name);
+		$this->email->setFromName($fromName); 
+		return $this; 
+	}
+
+	/**
+	 * Set the email subject
+	 *
+	 * @param string $subject 
+	 * @return this 
+	 *
+	 */
+	public function subject($subject) {
+		$this->email->setSubject($this->sanitizeHeader($subject)); 	
+		return $this; 
+	}
+
+	/**
+	 * Set the email message body (text only)
+	 *
+	 * @param string $body in text only
+	 * @return this 
+	 *
+	 */
+	public function body($body) {
+		$this->email->setText($body); 
+		return $this; 
+	}
+
+	/**
+	 * Set the email message body (HTML only)
+	 *
+	 * @param string $body in HTML
+	 * @return this 
+	 *
+	 */
+	public function bodyHTML($body) {
+		$this->email->setHtml($body); 
+		return $this; 
+	}
+
+	/**
+	 * Set any email header
+	 *
+	 * Note: multiple calls will append existing headers. 
+	 * To remove an existing header, specify NULL as the value. 
+	 *
+	 * @param string $key
+	 * @param string $value
+	 * @return this 
+	 *
+	 */
+	public function header($key, $value) {
+		if(is_null($value)) {
+			$this->email->removeHeader($k);
+		} else { 
+			$k = $this->wire('sanitizer')->name($this->sanitizeHeader($key)); 
+			// ensure consistent capitalization for all header keys
+			$k = ucwords(str_replace('-', ' ', $k)); 
+			$k = str_replace(' ', '-', $k); 
+			$v = $this->sanitizeHeader($value); 
+			$this->email->addHeader($k, $v); 
+		}
+		return $this; 
+	}
+	
+	/*
+	This attaches the file to each message sent (not a method currently provided in WireMail but Horst's WireMailSmtp has it)
+	
+	From SendGrid docs:
+	Attachments are currently file based only, with future plans for an in memory implementation as well.
+	File attachments are limited to 7 MB per file.
+	$email = new SendGrid\Email();
+	$email->addTo('foo@bar.com')->
+	       ...
+	       addAttachment("../path/to/file.txt");    
+	Important Gotcha: setBcc is not supported with attachments. This is by design. Instead use multiple addTos. Each user will receive their own personalized email with that setup, and only see their own email.	
+	*/
+	/**
+	 * Add attachment
+	 *
+	 * @param string $path
+	 * @return this 
+	 *
+	 */
+	public function attachment($path) {
+		if(is_readable($path))$this->email->addAttachment($path); 
+		return $this; 
+	}
+	
+	
+	
+	
+	/**
+	 * Set any email param 
+	 * 
+	 * THIS IS NOT APPLICABLE TO SENDGRID SO WE DO NOTHING
+	 *
+	 * See $additional_parameters at: http://www.php.net/manual/en/function.mail.php
+	 *
+	 * @param string $value
+	 * @return this 
+	 *
+	 */
+	 
+	public function param($value) {
+		return $this; 
+	}
+
+	/**
+	 * Send the email
+	 *
+	 * @return int Returns a positive number (indicating number of addresses emailed) or 0 on failure. 
+	 *
+	 * SendGrid doesn't actually return that number so we count the email addresses and if we get "success" we return that count. It's not a guarantee that all went through.
+	 * $this->message is usually 'success' or 'error'
+	 * If there were errors expect an array of error message texts in $this->error
+	 */
+	public function ___send() {
+
+		$tos = $this->email->smtpapi->to;	//array
+		if(empty($tos)) throw new WireException("Please set a 'to' address before sending."); 
+		$qty = count($tos);
+
+		$response = $this->sg->send($this->email); 
+		$this->message = (empty($response->message)) ? '' : $response->message;
+		$this->error = (empty($response->error)) ? '' : $response->error;
+		
+		if($this->log){
+			ob_start();
+			var_dump($response);
+			$str = ob_get_clean();
+			$this->log->save(__LINE__.' '.__FUNCTION__." qty=$qty response: $str");
+		}
+		return (strcmp($this->message, 'success') == 0) ? $qty : false;
+	}
+	
+	public function whoFrom(){	//just for a test
+		$from = $this->email->getFrom();
+		return $from;
+	}
+
+	public function logTos() {
+		if($this->log){
+			$tos = $this->email->smtpapi->to;	//array
+			if(empty($tos)) $str == "Empty";
+			else{ 
+				ob_start();
+				var_dump($tos);
+				$str = ob_get_clean();
+			}
+			$this->log->save(__LINE__.' '.__FUNCTION__." $str");
+		}
+		return $this;
+	}
+
+	
+	/**
+	 * Configure
+	 */
+	public static function getModuleConfigInputfields(array $data) {
+		global $config;
+		
+		$defaults = self::getDefaultData();
+		$data = array_merge($defaults, $data);
+		
+		if(!isset($data['sgPath'])) $data['sgPath'] = self::defaultSgPath; 	
+		if(!isset($data['logFile'])) $data['logFileName'] = self::defaultLogFileName; 	
+		
+		$form = new InputfieldWrapper();
+		//row
+		$f = wire('modules')->get('InputfieldText'); 
+		$f->attr('name', 'sgPath'); 
+		$f->attr('value', $data['sgPath']); 
+		$f->label = __('Path to SendGrid library'); 
+		$f->description = __('Relative to template folder. Example: "/includes/sendgrid-php/"'); 
+		$f->columnWidth = 40;
+		$form->add($f);
+		$f = wire('modules')->get('InputfieldText'); 
+		$f->attr('name', 'sgUser'); 
+		$f->attr('value', $data['sgUser']); 
+		$f->label = __('SendGrid username'); 
+		$f->description = __(''); 
+		$f->columnWidth = 30;
+		$form->add($f);
+		$f = wire('modules')->get('InputfieldText'); 
+		$f->type = 'password';
+		$f->attr('name', 'sgPass'); 
+		$f->attr('value', $data['sgPass']); 
+		$f->label = __('SendGrid password'); 
+		$f->description = __(''); 
+		$f->columnWidth = 30;
+		$form->add($f);
+		//row
+		$f = wire('modules')->get('InputfieldCheckbox'); 
+		$f->attr('name', 'logEnable'); 
+		$f->attr('value', 1);
+		if($data['logEnable']) $f->attr('checked', 'checked');
+		else $f->attr('checked', '');
+		$f->label = __('Enable basic logging'); 
+		$f->description = __('Helpful for troubleshooting. Not for production.'); 
+		$f->columnWidth = 40;
+		$form->add($f);
+		$f = wire('modules')->get('InputfieldText'); 
+		$f->attr('name', 'logFileName'); 
+		$f->attr('value', $data['logFileName']); 
+		$f->label = __('Filename for log (without extension)'); 
+		$f->description = __('The log will appear in '.$config->paths->logs); 
+		$f->columnWidth = 60;
+		$form->add($f);
+		//row
+		$f = wire('modules')->get('InputfieldMarkup');
+		$f->description = __('See the readme file for information about getting an account from SendGrid and installing their PHP helper library.');
+		$form->add($f);
+		return $form; 
+	}
+}
